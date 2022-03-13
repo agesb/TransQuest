@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-
 from __future__ import absolute_import, division, print_function
 
 import glob
@@ -17,6 +16,8 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
+from PIL import Image
 import torch
 from scipy.stats import mode
 from sklearn.metrics import (
@@ -25,7 +26,8 @@ from sklearn.metrics import (
     matthews_corrcoef,
 )
 from tensorboardX import SummaryWriter
-from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, TensorDataset
+from torchviz import *
+from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, TensorDataset, ConcatDataset
 from tqdm.auto import tqdm, trange
 from transformers import (
     BertConfig,
@@ -41,6 +43,9 @@ from transformers import (
     XLMRobertaConfig,
     XLMRobertaTokenizer,
     XLMTokenizer,
+    #RemBertConfig,
+    #RemBertTokenizer,
+    #RemBertForSequenceClassification
 )
 from transformers.convert_graph_to_onnx import convert, quantize
 from transformers.optimization import AdamW, Adafactor
@@ -53,15 +58,16 @@ from transformers.optimization import (
     get_polynomial_decay_schedule_with_warmup,
 )
 
-from transquest.algo.sentence_level.monotransquest.model_args import MonoTransQuestArgs
-from transquest.algo.sentence_level.monotransquest.models.bert_model import BertForSequenceClassification
-from transquest.algo.sentence_level.monotransquest.models.distilbert_model import DistilBertForSequenceClassification
-from transquest.algo.sentence_level.monotransquest.models.roberta_model import RobertaForSequenceClassification
-from transquest.algo.sentence_level.monotransquest.models.xlm_model import XLMForSequenceClassification
-from transquest.algo.sentence_level.monotransquest.models.xlm_roberta_model import XLMRobertaForSequenceClassification
-from transquest.algo.sentence_level.monotransquest.utils import LazyClassificationDataset, InputExample, \
+import sys
+
+from CODE.transquest.algo.sentence_level.monotransquest.model_args import MonoTransQuestArgs
+from CODE.transquest.algo.sentence_level.monotransquest.models.roberta_model import RobertaForSequenceClassification
+from CODE.transquest.algo.sentence_level.monotransquest.models.xlm_model import XLMForSequenceClassification
+from CODE.transquest.algo.sentence_level.monotransquest.models.xlm_roberta_model import XLMRobertaForSequenceClassification
+from CODE.transquest.algo.sentence_level.monotransquest.utils import LazyClassificationDataset, InputExample, \
     convert_examples_to_features
-from transquest.algo.word_level.microtransquest.utils import sweep_config_to_sweep_values
+from CODE.transquest.algo.sentence_level.monotransquest.utils import sweep_config_to_sweep_values
+
 
 try:
     import wandb
@@ -78,6 +84,7 @@ class MonoTransQuestModel:
             self,
             model_type,
             model_name,
+            wandb_group = None,
             num_labels=None,
             weight=None,
             args=None,
@@ -102,13 +109,15 @@ class MonoTransQuestModel:
             **kwargs (optional): For providing proxies, force_download, resume_download, cache_dir and other options specific to the 'from_pretrained' implementation where this will be supplied.
         """  # noqa: ignore flake8"
 
+            #"bert": (BertConfig, BertForSequenceClassification, BertTokenizer),
+            #"distilbert": (DistilBertConfig, DistilBertForSequenceClassification, DistilBertTokenizer),
         MODEL_CLASSES = {
-            "bert": (BertConfig, BertForSequenceClassification, BertTokenizer),
-            "distilbert": (DistilBertConfig, DistilBertForSequenceClassification, DistilBertTokenizer),
+            
             "longformer": (LongformerConfig, LongformerForSequenceClassification, LongformerTokenizer),
             "roberta": (RobertaConfig, RobertaForSequenceClassification, RobertaTokenizer),
             "xlm": (XLMConfig, XLMForSequenceClassification, XLMTokenizer),
             "xlmroberta": (XLMRobertaConfig, XLMRobertaForSequenceClassification, XLMRobertaTokenizer),
+            #"rembert":(RemBertConfig, RemBertForSequenceClassification, RemBertTokenizer)
         }
 
         self.args = self._load_model_args(model_name)
@@ -129,6 +138,16 @@ class MonoTransQuestModel:
         else:
             self.is_sweeping = False
 
+        if "task_config" in kwargs:
+            task_config = kwargs.pop("task_config")
+            task_values = sweep_config_to_sweep_values(task_config)
+            self.args.update_from_dict(task_values)
+
+        if wandb_group:
+            self.wandb_group = wandb_group
+
+        random.seed(1)
+        np.random.seed(1)
         if self.args.manual_seed:
             random.seed(self.args.manual_seed)
             np.random.seed(self.args.manual_seed)
@@ -247,7 +266,7 @@ class MonoTransQuestModel:
         self.args.model_name = model_name
         self.args.model_type = model_type
 
-        if model_type in ["camembert", "xlmroberta"]:
+        if model_type in ["camembert", "xlmroberta", "rembert"]:
             warnings.warn(
                 f"use_multiprocessing automatically disabled as {model_type}"
                 " fails when using multiprocessing for feature conversion."
@@ -261,6 +280,7 @@ class MonoTransQuestModel:
     def train_model(
             self,
             train_df,
+            focal_loss=False,
             multi_label=False,
             output_dir=None,
             show_running_loss=True,
@@ -309,6 +329,8 @@ class MonoTransQuestModel:
             )
         self._move_model_to_device()
 
+        if focal_loss:
+            train_df = train_df.sample(frac=1, random_state=777)
         if isinstance(train_df, str) and self.args.lazy_loading:
             if self.args.sliding_window:
                 raise ValueError("Lazy loading cannot be used with sliding window.")
@@ -357,7 +379,13 @@ class MonoTransQuestModel:
                     for i, (text, label) in enumerate(zip(train_df.iloc[:, 0], train_df.iloc[:, 1]))
                 ]
             train_dataset = self.load_and_cache_examples(train_examples, verbose=verbose)
-        train_sampler = RandomSampler(train_dataset)
+
+        if focal_loss:
+            train_sampler = SequentialSampler(train_dataset)
+            focal_weights = train_df["focal_weights"]
+
+        else:
+            train_sampler = RandomSampler(train_dataset)
         train_dataloader = DataLoader(
             train_dataset,
             sampler=train_sampler,
@@ -367,21 +395,192 @@ class MonoTransQuestModel:
 
         os.makedirs(output_dir, exist_ok=True)
 
-        global_step, training_details = self.train(
-            train_dataloader,
-            output_dir,
-            multi_label=multi_label,
-            show_running_loss=show_running_loss,
-            eval_df=eval_df,
-            verbose=verbose,
+        if focal_loss:
+            global_step, training_details = self.train(
+                train_dataloader,
+                output_dir,
+                multi_label=multi_label,
+                show_running_loss=show_running_loss,
+                eval_df=eval_df,
+                verbose=verbose,
+                **dict(kwargs, focal_weights=focal_weights)
+            )
+
+        else:
+            global_step, training_details = self.train(
+                train_dataloader,
+                output_dir,
+                multi_label=multi_label,
+                show_running_loss=show_running_loss,
+                eval_df=eval_df,
+                verbose=verbose,
+                **kwargs
+            )
+
+
+
+        # model_to_save = self.model.module if hasattr(self.model, "module") else self.model
+        # model_to_save.save_pretrained(output_dir)
+        # self.tokenizer.save_pretrained(output_dir)
+        # torch.save(self.args, os.path.join(output_dir, "training_args.bin"))
+        self.save_model(self.args.best_model_dir,model=self.model)
+
+        if verbose:
+            logger.info(" Training of {} model complete. Saved to {}.".format(self.args.model_type, output_dir))
+
+        return global_step, training_details
+
+
+    def train_model_with_focal_loss(
+            self,
+            bias_model,
+            bias_type,
+            train_dfs,
+            output_dir=None,
+            show_running_loss=True,
+            args=None,
+            eval_dfs=None,
+            verbose=True,
             **kwargs,
+    ):
+        """
+        Trains the model using 'train_df'
+
+        Args:
+            train_df: Pandas Dataframe containing at least two columns. If the Dataframe has a header, it should contain a 'text' and a 'labels' column. If no header is present,
+            the Dataframe should contain at least two columns, with the first column containing the text, and the second column containing the label. The model will be trained on this Dataframe.
+            output_dir: The directory where model files will be saved. If not given, self.args.output_dir will be used.
+            show_running_loss (optional): Set to False to prevent running loss from being printed to console. Defaults to True.
+            args (optional): Optional changes to the args dict of the model. Any changes made will persist for the model.
+            eval_df (optional): A DataFrame against which evaluation will be performed when evaluate_during_training is enabled. Is required if evaluate_during_training is enabled.
+            **kwargs: Additional metrics that should be used. Pass in the metrics as keyword arguments (name of metric: function to use). E.g. f1=sklearn.metrics.f1_score.
+                        A metric function should take in two parameters. The first parameter will be the true labels, and the second parameter will be the predictions.
+
+        Returns:
+            global_step: Number of global steps trained
+            training_details: Average training loss if evaluate_during_training is False or full training progress scores if evaluate_during_training is True
+        """  # noqa: ignore flake8"
+
+        assert bias_type in ['partial_input', 'sentence_length']
+
+        if args:
+            self.args.update_from_dict(args)
+
+        if self.args.silent:
+            show_running_loss = False
+
+        if self.args.evaluate_during_training and eval_dfs is None:
+            raise ValueError(
+                "evaluate_during_training is enabled but eval_df is not specified."
+                " Pass eval_df to model.train_model() if using evaluate_during_training."
+            )
+
+        if not output_dir:
+            output_dir = self.args.output_dir
+
+        if os.path.exists(output_dir) and os.listdir(output_dir) and not self.args.overwrite_output_dir:
+            raise ValueError(
+                "Output directory ({}) already exists and is not empty."
+                " Set overwrite_output_dir: True to automatically overwrite.".format(output_dir)
+            )
+        self._move_model_to_device()
+        if bias_type == 'partial_input':
+            bias_model.model.to(self.device)
+        elif bias_type== 'sentence_length':
+            bias_model.to(self.device)
+
+        train_dataloaders = []
+        random_state = random.randint(0,9999)
+        for train_df in train_dfs:
+
+            train_df = train_df.sample(frac=1, random_state=random_state)
+
+            if isinstance(train_df, str) and self.args.lazy_loading:
+                if self.args.sliding_window:
+                    raise ValueError("Lazy loading cannot be used with sliding window.")
+                if self.args.model_type == "layoutlm":
+                    raise NotImplementedError("Lazy loading is not implemented for LayoutLM models")
+                #train_datasets.append(LazyClassificationDataset(train_df, self.tokenizer, self.args))
+            else:
+                if self.args.lazy_loading:
+                    raise ValueError("Input must be given as a path to a file when using lazy loading")
+                if "text" in train_df.columns and "labels" in train_df.columns and not "sentence_length" in train_df.columns:
+                    if self.args.model_type == "layoutlm":
+                        train_examples = [
+                            InputExample(i, text, None, label, x0, y0, x1, y1)
+                            for i, (text, label, x0, y0, x1, y1) in enumerate(
+                                zip(
+                                    train_df["text"].astype(str),
+                                    train_df["labels"],
+                                    train_df["x0"],
+                                    train_df["y0"],
+                                    train_df["x1"],
+                                    train_df["y1"],
+                                )
+                            )
+                        ]
+                    else:
+                        train_examples = [
+                            InputExample(i, text, None, label)
+                            for i, (text, label) in enumerate(zip(train_df["text"].astype(str), train_df["labels"]))
+                        ]
+                elif "text_a" in train_df.columns and "text_b" in train_df.columns and not "sentence_length" in train_df.columns:
+                    if self.args.model_type == "layoutlm":
+                        raise ValueError("LayoutLM cannot be used with sentence-pair tasks")
+                    else:
+                        train_examples = [
+                            InputExample(i, text_a, text_b, label)
+                            for i, (text_a, text_b, label) in enumerate(
+                                zip(train_df["text_a"].astype(str), train_df["text_b"].astype(str), train_df["labels"])
+                            )
+                        ]
+                elif "sentence_length" in train_df.columns:
+                    train_input = torch.tensor(train_df['sentence_length'].values.astype(np.float32))
+                    train_target = torch.tensor(train_df['labels'].values.astype(np.float32))
+                    train_dataset = TensorDataset(train_input, train_target)
+                    train_dataloader = DataLoader(dataset=train_dataset, batch_size=self.args.train_batch_size,
+                                                  shuffle=False)
+
+                else:
+                    warnings.warn(
+                        "Dataframe headers not specified. Falling back to using column 0 as text and column 1 as labels."
+                    )
+                    train_examples = [
+                        InputExample(i, text, None, label)
+                        for i, (text, label) in enumerate(zip(train_df.iloc[:, 0], train_df.iloc[:, 1]))
+                    ]
+
+                if "sentence_length" not in train_df.columns:
+                    train_dataset = self.load_and_cache_examples(train_examples, verbose=verbose)
+
+                    train_sampler = SequentialSampler(train_dataset)
+                    train_dataloader = DataLoader(
+                        train_dataset,
+                        sampler=train_sampler,
+                        batch_size=self.args.train_batch_size,
+                        num_workers=self.args.dataloader_num_workers,
+                    )
+
+                train_dataloaders.append(train_dataloader)
+
+        os.makedirs(output_dir, exist_ok=True)
+
+        global_step, training_details = self.train_with_focal_loss(
+            bias_model,
+            bias_type,
+            train_dataloaders,
+            output_dir,
+            show_running_loss=show_running_loss,
+            eval_dfs=eval_dfs,
+            verbose=verbose,
+            **kwargs
         )
 
         # model_to_save = self.model.module if hasattr(self.model, "module") else self.model
         # model_to_save.save_pretrained(output_dir)
         # self.tokenizer.save_pretrained(output_dir)
         # torch.save(self.args, os.path.join(output_dir, "training_args.bin"))
-        self.save_model(model=self.model)
+        self.save_model(self.args.best_model_dir,model=self.model)
 
         if verbose:
             logger.info(" Training of {} model complete. Saved to {}.".format(self.args.model_type, output_dir))
@@ -400,7 +599,6 @@ class MonoTransQuestModel:
     ):
         """
         Trains the model on train_dataset.
-
         Utility function to be used by the train_model() method. Not intended to be used directly.
         """
 
@@ -572,7 +770,8 @@ class MonoTransQuestModel:
         if args.wandb_project:
             if not wandb.setup().settings.sweep_id:
                 logger.info(" Initializing WandB run for training.")
-                wandb.init(project=args.wandb_project, config={**asdict(args)}, **args.wandb_kwargs)
+                print(args)
+                wandb.init(project=args.wandb_project, group=self.wandb_group, config={**asdict(args)}, **args.wandb_kwargs)
             wandb.watch(self.model)
 
         if self.args.fp16:
@@ -592,21 +791,48 @@ class MonoTransQuestModel:
                 disable=args.silent,
                 mininterval=0,
             )
+
+            focal_loss=False
+            if "focal_weights" in kwargs:
+                print("Training with debiased focal loss")
+                focal_weights = kwargs.pop("focal_weights")
+                focal_loss = True
+
             for step, batch in enumerate(batch_iterator):
                 if steps_trained_in_current_epoch > 0:
                     steps_trained_in_current_epoch -= 1
                     continue
+
+                if focal_loss:
+                    start = step * self.args.train_batch_size
+                    end = min((step + 1) * self.args.train_batch_size, len(focal_weights))
+                    focal_weights_batch = focal_weights[start:end]
 
                 inputs = self._get_inputs_dict(batch)
                 if self.args.fp16:
                     with amp.autocast():
                         outputs = model(**inputs)
                         # model outputs are always tuple in pytorch-transformers (see doc)
-                        loss = outputs[0]
+                        if focal_loss:
+                            focal_weights_tensor = torch.tensor(focal_weights_batch.values)
+                            focal_weights_tensor = focal_weights_tensor.to(self.device)
+                            loss = (focal_weights_tensor * outputs[2]).mean()
+                        else:
+                            loss = outputs[0]
                 else:
                     outputs = model(**inputs)
                     # model outputs are always tuple in pytorch-transformers (see doc)
-                    loss = outputs[0]
+                    if focal_loss:
+                        focal_weights_tensor= torch.tensor(focal_weights_batch.values)
+                        focal_weights_tensor = focal_weights_tensor.to(self.device)
+                        sig01= 1/(1+(focal_weights_tensor/(1-focal_weights_tensor))**(-3))
+                        loss = (focal_weights_tensor**4* outputs[2]).mean()
+
+
+                    else:
+                        loss = outputs[0]
+
+
 
                 if args.n_gpu > 1:
                     loss = loss.mean()  # mean() to average on multi-gpu parallel training
@@ -849,6 +1075,610 @@ class MonoTransQuestModel:
             tr_loss / global_step if not self.args.evaluate_during_training else training_progress_scores,
         )
 
+    def train_with_focal_loss(
+            self,
+            bias_model,
+            bias_type,
+            train_dataloaders,
+            output_dir,
+            multi_label=False,
+            show_running_loss=True,
+            eval_dfs=None,
+            verbose=True,
+            **kwargs,
+    ):
+        """
+        Trains the model on train_dataset.
+
+        Utility function to be used by the train_model_with_focal_loss() method. Not intended to be used directly.
+        """
+
+        torch.autograd.set_detect_anomaly(True)
+        model = self.model
+        args = self.args
+
+        tb_writer = SummaryWriter(logdir=args.tensorboard_dir)
+
+        t_total = len(train_dataloaders[0]) // args.gradient_accumulation_steps * args.num_train_epochs
+
+        no_decay = ["bias", "LayerNorm.weight"]
+
+        optimizer_grouped_parameters = []
+        custom_parameter_names = set()
+        for group in self.args.custom_parameter_groups:
+            params = group.pop("params")
+            custom_parameter_names.update(params)
+            param_group = {**group}
+            param_group["params"] = [p for n, p in model.named_parameters() if n in params]
+            optimizer_grouped_parameters.append(param_group)
+
+        for group in self.args.custom_layer_parameters:
+            layer_number = group.pop("layer")
+            layer = f"layer.{layer_number}."
+            group_d = {**group}
+            group_nd = {**group}
+            group_nd["weight_decay"] = 0.0
+            params_d = []
+            params_nd = []
+            for n, p in model.named_parameters():
+                if n not in custom_parameter_names and layer in n:
+                    if any(nd in n for nd in no_decay):
+                        params_nd.append(p)
+                    else:
+                        params_d.append(p)
+                    custom_parameter_names.add(n)
+            group_d["params"] = params_d
+            group_nd["params"] = params_nd
+
+            optimizer_grouped_parameters.append(group_d)
+            optimizer_grouped_parameters.append(group_nd)
+
+        if not self.args.train_custom_parameters_only:
+            optimizer_grouped_parameters.extend(
+                [
+                    {
+                        "params": [
+                            p
+                            for n, p in model.named_parameters()
+                            if n not in custom_parameter_names and not any(nd in n for nd in no_decay)
+                        ],
+                        "weight_decay": args.weight_decay,
+                    },
+                    {
+                        "params": [
+                            p
+                            for n, p in model.named_parameters()
+                            if n not in custom_parameter_names and any(nd in n for nd in no_decay)
+                        ],
+                        "weight_decay": 0.0,
+                    },
+                ]
+            )
+
+        warmup_steps = math.ceil(t_total * args.warmup_ratio)
+        args.warmup_steps = warmup_steps if args.warmup_steps == 0 else args.warmup_steps
+
+        if args.optimizer == "AdamW":
+            optimizer_main = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
+            optimizer_bias = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
+
+        elif args.optimizer == "Adafactor":
+            optimizer_main = Adafactor(
+                optimizer_grouped_parameters,
+                lr=args.learning_rate,
+                eps=args.adafactor_eps,
+                clip_threshold=args.adafactor_clip_threshold,
+                decay_rate=args.adafactor_decay_rate,
+                beta1=args.adafactor_beta1,
+                weight_decay=args.weight_decay,
+                scale_parameter=args.adafactor_scale_parameter,
+                relative_step=args.adafactor_relative_step,
+                warmup_init=args.adafactor_warmup_init,
+            )
+            optimizer_bias = Adafactor(
+                optimizer_grouped_parameters,
+                lr=args.learning_rate,
+                eps=args.adafactor_eps,
+                clip_threshold=args.adafactor_clip_threshold,
+                decay_rate=args.adafactor_decay_rate,
+                beta1=args.adafactor_beta1,
+                weight_decay=args.weight_decay,
+                scale_parameter=args.adafactor_scale_parameter,
+                relative_step=args.adafactor_relative_step,
+                warmup_init=args.adafactor_warmup_init,
+            )
+            print("Using Adafactor for T5")
+        else:
+            raise ValueError(
+                "{} is not a valid optimizer class. Please use one of ('AdamW', 'Adafactor') instead.".format(
+                    args.optimizer
+                )
+            )
+
+        if args.scheduler == "constant_schedule":
+            scheduler_main = get_constant_schedule(optimizer_main)
+            scheduler_bias = get_constant_schedule(optimizer_bias)
+
+
+        elif args.scheduler == "constant_schedule_with_warmup":
+            scheduler_main = get_constant_schedule_with_warmup(optimizer_main, num_warmup_steps=args.warmup_steps)
+            scheduler_bias = get_constant_schedule_with_warmup(optimizer_bias, num_warmup_steps=args.warmup_steps)
+
+
+        elif args.scheduler == "linear_schedule_with_warmup":
+            scheduler_main = get_linear_schedule_with_warmup(
+                optimizer_main, num_warmup_steps=args.warmup_steps, num_training_steps=t_total
+            )
+            scheduler_bias = get_linear_schedule_with_warmup(
+                optimizer_bias, num_warmup_steps=args.warmup_steps, num_training_steps=t_total
+            )
+
+        elif args.scheduler == "cosine_schedule_with_warmup":
+            scheduler_main = get_cosine_schedule_with_warmup(
+                optimizer_main,
+                num_warmup_steps=args.warmup_steps,
+                num_training_steps=t_total,
+                num_cycles=args.cosine_schedule_num_cycles,
+            )
+            scheduler_bias = get_cosine_schedule_with_warmup(
+                optimizer_bias,
+                num_warmup_steps=args.warmup_steps,
+                num_training_steps=t_total,
+                num_cycles=args.cosine_schedule_num_cycles,
+            )
+
+        elif args.scheduler == "cosine_with_hard_restarts_schedule_with_warmup":
+            scheduler_main = get_cosine_with_hard_restarts_schedule_with_warmup(
+                optimizer_main,
+                num_warmup_steps=args.warmup_steps,
+                num_training_steps=t_total,
+                num_cycles=args.cosine_schedule_num_cycles,
+            )
+            scheduler_bias = get_cosine_with_hard_restarts_schedule_with_warmup(
+                optimizer_bias,
+                num_warmup_steps=args.warmup_steps,
+                num_training_steps=t_total,
+                num_cycles=args.cosine_schedule_num_cycles,
+            )
+
+        elif args.scheduler == "polynomial_decay_schedule_with_warmup":
+            scheduler_main = get_polynomial_decay_schedule_with_warmup(
+                optimizer_main,
+                num_warmup_steps=args.warmup_steps,
+                num_training_steps=t_total,
+                lr_end=args.polynomial_decay_schedule_lr_end,
+                power=args.polynomial_decay_schedule_lr_end,
+            )
+            scheduler_bias = get_polynomial_decay_schedule_with_warmup(
+                optimizer_bias,
+                num_warmup_steps=args.warmup_steps,
+                num_training_steps=t_total,
+                lr_end=args.polynomial_decay_schedule_lr_end,
+                power=args.polynomial_decay_schedule_lr_end,
+            )
+
+        else:
+            raise ValueError("{} is not a valid scheduler.".format(args.scheduler))
+
+        if args.n_gpu > 1:
+            model = torch.nn.DataParallel(model)
+
+        global_step = 0
+        training_progress_scores = None
+        tr_loss, logging_loss = 0.0, 0.0
+        model.zero_grad()
+        if bias_type == "partial_input":
+            bias_model.model.zero_grad()
+        else:
+            bias_model.zero_grad()
+        train_iterator = trange(int(args.num_train_epochs), desc="Epoch", disable=args.silent, mininterval=0)
+        epoch_number = 0
+        best_eval_metric = None
+        early_stopping_counter = 0
+        steps_trained_in_current_epoch = 0
+        epochs_trained = 0
+        current_loss_main = "Initializing"
+        current_loss_bias = "Initializing"
+        current_loss_focal = "Initializing"
+
+        if args.model_name and os.path.exists(args.model_name):
+            try:
+                # set global_step to gobal_step of last saved checkpoint from model path
+                checkpoint_suffix = args.model_name.split("/")[-1].split("-")
+                if len(checkpoint_suffix) > 2:
+                    checkpoint_suffix = checkpoint_suffix[1]
+                else:
+                    checkpoint_suffix = checkpoint_suffix[-1]
+                global_step = int(checkpoint_suffix)
+                epochs_trained = global_step // (len(train_dataloaders[0]) // args.gradient_accumulation_steps)
+                steps_trained_in_current_epoch = global_step % (
+                        len(train_dataloaders[0]) // args.gradient_accumulation_steps
+                )
+
+                logger.info("   Continuing training from checkpoint, will skip to saved global_step")
+                logger.info("   Continuing training from epoch %d", epochs_trained)
+                logger.info("   Continuing training from global step %d", global_step)
+                logger.info("   Will skip the first %d steps in the current epoch", steps_trained_in_current_epoch)
+            except ValueError:
+                logger.info("   Starting fine-tuning.")
+
+        if args.evaluate_during_training:
+            training_progress_scores_main = self._create_training_progress_scores(multi_label, **kwargs)
+            training_progress_scores_bias = self._create_training_progress_scores(multi_label, **kwargs)
+
+        if args.wandb_project:
+            if not wandb.setup().settings.sweep_id:
+                logger.info(" Initializing WandB run for training.")
+                wandb.init(project=args.wandb_project, group=self.wandb_group, config={**asdict(args)}, **args.wandb_kwargs)
+            wandb.watch(self.model)
+
+        if self.args.fp16:
+            from torch.cuda import amp
+
+            scaler_main = amp.GradScaler()
+            scaler_bias = amp.GradScaler()
+
+        if bias_type == 'sentence_length':
+            optimizer_SL = torch.optim.Adam(bias_model.parameters(), lr=self.args.lr_sentence_length)
+            mse_sentence_length_loss = torch.nn.MSELoss(reduction = 'none')
+        for _ in train_iterator:
+            model.train()
+            if bias_type == 'partial_input':
+                bias_model.model.train()
+            else:
+                bias_model.train()
+            if epochs_trained > 0:
+                epochs_trained -= 1
+                continue
+            train_iterator.set_description(f"Epoch {epoch_number + 1} of {args.num_train_epochs}")
+            batch_iterator_main = tqdm(
+                train_dataloaders[0],
+                desc=f"Running Epoch {epoch_number} of {args.num_train_epochs}",
+                disable=args.silent,
+                mininterval=0,
+            )
+            batch_iterator_bias = tqdm(
+                train_dataloaders[1],
+                desc=f"Running Epoch {epoch_number} of {args.num_train_epochs}",
+                disable=args.silent,
+                mininterval=0,
+            )
+            for step, (main_batch, bias_batch) in enumerate(zip(batch_iterator_main, batch_iterator_bias)):
+                if steps_trained_in_current_epoch > 0:
+                    steps_trained_in_current_epoch -= 1
+                    continue
+
+                inputs_main = self._get_inputs_dict(main_batch)
+                if bias_type == "partial_input":
+                    inputs_bias = self._get_inputs_dict(bias_batch)
+                if self.args.fp16:
+                    with amp.autocast():
+                        outputs_main = model(**inputs_main)
+                        if bias_type == 'partial_input':
+                            outputs_bias = bias_model.model(**inputs_bias)
+                        elif bias_type == 'sentence_length':
+                            bias_model.train()
+                            s_input, s_labels = bias_batch[0].unsqueeze(dim=1).to(self.device), bias_batch[1].to(self.device)
+                            optimizer_SL.zero_grad()
+                            s_out = bias_model(s_input)
+                            s_out = s_out.squeeze()
+                            sentence_length_loss_per_sample = mse_sentence_length_loss(s_out, s_labels)
+                            sentence_length_loss = sentence_length_loss_per_sample.mean()
+                            print("Sentence_length_loss:", sentence_length_loss_per_sample)
+                            print("Sentence_length_loss reduced",sentence_length_loss)
+                            sentence_length_loss.backward(retain_graph=True)
+
+                            outputs_bias = (sentence_length_loss, s_out)
+                        else: print('Please specify bias type')
+
+                        loss_main = outputs_main[0]
+                        loss_bias = outputs_bias[0]
+
+                else:
+                    outputs_main = model(**inputs_main)
+                    if bias_type == 'partial_input':
+                        outputs_bias = bias_model.model(**inputs_bias)
+                    elif bias_type == 'sentence_length':
+                        bias_model.train()
+                        s_input, s_labels = bias_batch[0].unsqueeze(dim=1).to(self.device), bias_batch[1].to(
+                            self.device)
+                        optimizer_SL.zero_grad()
+                        s_out = bias_model(s_input)
+                        s_out = s_out.squeeze()
+                        sentence_length_loss_per_sample = mse_sentence_length_loss(s_out, s_labels)
+                        sentence_length_loss = sentence_length_loss_per_sample.mean()
+                        sentence_length_loss.backward()
+                        outputs_bias = (sentence_length_loss, s_out, sentence_length_loss_per_sample)
+                    else: print('Please specify bias type')
+                    loss_main = outputs_main[0]
+                    loss_bias = outputs_bias[0]
+                    loss_main_per_sample = outputs_main[2]
+                    loss_bias_per_sample = outputs_bias[2]
+
+                if args.n_gpu > 1:
+                    # mean() to average on multi-gpu parallel training
+                    loss_main = loss_main.mean()
+                    loss_bias = loss_bias.mean()
+
+                current_loss_main = loss_main.item()
+                current_loss_bias = loss_bias.item()
+
+                # Introduce focal loss to weight down samples which encourage the bias and vice versa
+                detached_loss_bias = loss_bias.detach()
+                focal_loss = loss_main * detached_loss_bias
+
+                #detached_loss_bias_per_sample = loss_bias_per_sample.detach()
+                #focal_loss = (detached_loss_bias_per_sample * loss_main_per_sample).mean()
+
+                current_loss_focal = focal_loss.item()
+
+                if show_running_loss:
+                    batch_iterator_main.set_description(
+                        f"Epochs {epoch_number}/{args.num_train_epochs}. Running Loss: {current_loss_main:9.4f}"
+                    )
+                    batch_iterator_bias.set_description(
+                        f"Epochs {epoch_number}/{args.num_train_epochs}. Running Loss: {current_loss_bias:9.4f}"
+                    )
+
+                if args.gradient_accumulation_steps > 1:
+                    focal_loss = focal_loss / args.gradient_accumulation_steps
+                    loss_main = loss_main / args.gradient_accumulation_steps
+                    loss_bias = loss_bias / args.gradient_accumulation_steps
+
+                if self.args.fp16:
+                    scaler_main.scale(focal_loss).backward()
+                    scaler_bias.scale(loss_bias).backward()
+                else:
+                    focal_loss.backward()
+                    if bias_type != "sentence_length":
+                        loss_bias.backward()
+
+                tr_loss += focal_loss.item()
+                if (step + 1) % args.gradient_accumulation_steps == 0:
+                    if self.args.fp16:
+                        scaler_main.unscale_(optimizer_main)
+                        scaler_bias.unscale_(optimizer_bias)
+                    if args.optimizer == "AdamW":
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                        if bias_type=="partial_input":
+                            torch.nn.utils.clip_grad_norm_(bias_model.model.parameters(), args.max_grad_norm)
+
+
+                    if self.args.fp16:
+                        scaler_main.step(optimizer_main)
+                        scaler_main.update()
+                        scaler_bias.step(optimizer_bias)
+                        scaler_bias.update()
+                    else:
+                        optimizer_main.step()
+                        if bias_type == "sentence_length":
+                            optimizer_SL.step()
+                        else:
+                            optimizer_bias.step()
+                    # Update learning rate schedule
+                    scheduler_main.step()
+                    scheduler_bias.step()
+                    model.zero_grad()
+                    if bias_type != 'sentence_length':
+                        bias_model.model.zero_grad()
+
+                    global_step += 1
+                    torch.cuda.empty_cache()
+
+                    if args.logging_steps > 0 and global_step % args.logging_steps == 0:
+                        # Log metrics
+                        tb_writer.add_scalar("lr", scheduler_main.get_last_lr()[0], global_step)
+                        tb_writer.add_scalar("focal_loss", (tr_loss - logging_loss) / args.logging_steps, global_step)
+                        logging_loss = tr_loss
+                        if args.wandb_project or self.is_sweeping:
+                            wandb.log(
+                                {
+                                    "Focal loss (training)": current_loss_focal,
+                                    "Main model loss (training)": current_loss_main,
+                                    "Bias model loss (training)": current_loss_bias,
+                                    "lr_main": scheduler_main.get_last_lr()[0],
+                                    "lr_bias": scheduler_main.get_last_lr()[0],
+                                    "global_step": global_step,
+                                }
+                            )
+
+                    if args.save_steps > 0 and global_step % args.save_steps == 0:
+                        # Save model checkpoint
+                        if args.save_recent_only:
+                            del_paths = glob.glob(os.path.join(output_dir, 'checkpoint-*'))
+                            for del_path in del_paths:
+                                shutil.rmtree(del_path)
+                        output_dir_current = os.path.join(output_dir, "checkpoint-{}".format(global_step))
+
+                        self.save_model(output_dir_current, optimizer_main, scheduler_main, model=model)
+
+                    if args.evaluate_during_training and (
+                            args.evaluate_during_training_steps > 0
+                            and global_step % args.evaluate_during_training_steps == 0
+                    ):
+
+                        # Only evaluate when single GPU otherwise metrics may not average well
+                        results, _, _ = self.eval_model(
+                            eval_dfs[0],
+                            verbose=verbose and args.evaluate_during_training_verbose,
+                            silent=args.evaluate_during_training_silent,
+                            wandb_log=True,
+                            **kwargs
+                        )
+                        for key, value in results.items():
+                            tb_writer.add_scalar("eval_{}".format(key), value, global_step)
+
+                        output_dir_current = os.path.join(output_dir, "checkpoint-{}".format(global_step))
+
+                        if args.save_eval_checkpoints:
+                            if args.save_recent_only:
+                                del_paths = glob.glob(os.path.join(output_dir, 'checkpoint-*'))
+                                for del_path in del_paths:
+                                    shutil.rmtree(del_path)
+                            self.save_model(output_dir_current, optimizer_main, scheduler_main, model=model, results=results)
+
+                        training_progress_scores_main["global_step"].append(global_step)
+                        training_progress_scores_main["train_loss"].append(current_loss_focal)
+                        for key in results:
+                            training_progress_scores_main[key].append(results[key])
+                        report = pd.DataFrame(training_progress_scores_main)
+                        report.to_csv(
+                            os.path.join(args.output_dir, "training_progress_scores_main.csv"), index=False,
+                        )
+
+                        if args.wandb_project or self.is_sweeping:
+                            wandb.log(self._get_last_metrics(training_progress_scores_main))
+
+                        if not best_eval_metric:
+                            best_eval_metric = results[args.early_stopping_metric]
+                            self.save_model(args.best_model_dir, optimizer_main, scheduler_main, model=model, results=results)
+                        if best_eval_metric and args.early_stopping_metric_minimize:
+                            if best_eval_metric - results[args.early_stopping_metric] > args.early_stopping_delta:
+                                best_eval_metric = results[args.early_stopping_metric]
+                                self.save_model(
+                                    args.best_model_dir, optimizer_main, scheduler_main, model=model, results=results
+                                )
+                                early_stopping_counter = 0
+                            else:
+                                if args.use_early_stopping:
+                                    if early_stopping_counter < args.early_stopping_patience:
+                                        early_stopping_counter += 1
+                                        if verbose:
+                                            logger.info(f" No improvement in {args.early_stopping_metric}")
+                                            logger.info(f" Current step: {early_stopping_counter}")
+                                            logger.info(f" Early stopping patience: {args.early_stopping_patience}")
+                                    else:
+                                        if verbose:
+                                            logger.info(f" Patience of {args.early_stopping_patience} steps reached")
+                                            logger.info(" Training terminated.")
+                                            train_iterator.close()
+                                        return (
+                                            global_step,
+                                            tr_loss / global_step
+                                            if not self.args.evaluate_during_training
+                                            else training_progress_scores_main,
+                                        )
+                        else:
+                            if results[args.early_stopping_metric] - best_eval_metric > args.early_stopping_delta:
+                                best_eval_metric = results[args.early_stopping_metric]
+                                self.save_model(
+                                    args.best_model_dir, optimizer_main, scheduler_main, model=model, results=results
+                                )
+                                early_stopping_counter = 0
+                            else:
+                                if args.use_early_stopping:
+                                    if early_stopping_counter < args.early_stopping_patience:
+                                        early_stopping_counter += 1
+                                        if verbose:
+                                            logger.info(f" No improvement in {args.early_stopping_metric}")
+                                            logger.info(f" Current step: {early_stopping_counter}")
+                                            logger.info(f" Early stopping patience: {args.early_stopping_patience}")
+                                    else:
+                                        if verbose:
+                                            logger.info(f" Patience of {args.early_stopping_patience} steps reached")
+                                            logger.info(" Training terminated.")
+                                            train_iterator.close()
+                                        return (
+                                            global_step,
+                                            tr_loss / global_step
+                                            if not self.args.evaluate_during_training
+                                            else training_progress_scores_main,
+                                        )
+
+            epoch_number += 1
+            # Rendering the architecture as a check that the focal loss model behaves correctly
+            #make_dot(focal_loss).render("attached", format="png")
+            output_dir_current = os.path.join(output_dir, "checkpoint-{}-epoch-{}".format(global_step, epoch_number))
+
+            if args.save_model_every_epoch or args.evaluate_during_training:
+                if args.save_recent_only:
+                    del_paths = glob.glob(os.path.join(output_dir, 'checkpoint-*'))
+                    for del_path in del_paths:
+                        shutil.rmtree(del_path)
+                os.makedirs(output_dir_current, exist_ok=True)
+
+            if args.save_model_every_epoch:
+                self.save_model(output_dir_current, optimizer_main, scheduler_main, model=model)
+
+            if args.evaluate_during_training and args.evaluate_each_epoch:
+                results, _, _ = self.eval_model(
+                    eval_dfs[0],
+                    verbose=verbose and args.evaluate_during_training_verbose,
+                    silent=args.evaluate_during_training_silent,
+                    wandb_log=False,
+                    **kwargs,
+                )
+
+                self.save_model(output_dir_current, optimizer_main, scheduler_main, results=results)
+
+                training_progress_scores_main["global_step"].append(global_step)
+                training_progress_scores_main["train_loss"].append(current_loss_focal)
+                for key in results:
+                    training_progress_scores_main[key].append(results[key])
+                report = pd.DataFrame(training_progress_scores_main)
+                report.to_csv(os.path.join(args.output_dir, "training_progress_scores_main.csv"), index=False)
+
+                if args.wandb_project or self.is_sweeping:
+                    wandb.log(self._get_last_metrics(training_progress_scores_main))
+
+                if not best_eval_metric:
+                    best_eval_metric = results[args.early_stopping_metric]
+                    self.save_model(args.best_model_dir, optimizer_main, scheduler_main, model=model, results=results)
+                if best_eval_metric and args.early_stopping_metric_minimize:
+                    if best_eval_metric - results[args.early_stopping_metric] > args.early_stopping_delta:
+                        best_eval_metric = results[args.early_stopping_metric]
+                        self.save_model(args.best_model_dir, optimizer_main, scheduler_main, model=model, results=results)
+                        early_stopping_counter = 0
+                    else:
+                        if args.use_early_stopping and args.early_stopping_consider_epochs:
+                            if early_stopping_counter < args.early_stopping_patience:
+                                early_stopping_counter += 1
+                                if verbose:
+                                    logger.info(f" No improvement in {args.early_stopping_metric}")
+                                    logger.info(f" Current step: {early_stopping_counter}")
+                                    logger.info(f" Early stopping patience: {args.early_stopping_patience}")
+                            else:
+                                if verbose:
+                                    logger.info(f" Patience of {args.early_stopping_patience} steps reached")
+                                    logger.info(" Training terminated.")
+                                    train_iterator.close()
+                                return (
+                                    global_step,
+                                    tr_loss / global_step
+                                    if not self.args.evaluate_during_training
+                                    else training_progress_scores_main,
+                                )
+                else:
+                    if results[args.early_stopping_metric] - best_eval_metric > args.early_stopping_delta:
+                        best_eval_metric = results[args.early_stopping_metric]
+                        self.save_model(args.best_model_dir, optimizer_main, scheduler_main, model=model, results=results)
+                        early_stopping_counter = 0
+                    else:
+                        if args.use_early_stopping and args.early_stopping_consider_epochs:
+                            if early_stopping_counter < args.early_stopping_patience:
+                                early_stopping_counter += 1
+                                if verbose:
+                                    logger.info(f" No improvement in {args.early_stopping_metric}")
+                                    logger.info(f" Current step: {early_stopping_counter}")
+                                    logger.info(f" Early stopping patience: {args.early_stopping_patience}")
+                            else:
+                                if verbose:
+                                    logger.info(f" Patience of {args.early_stopping_patience} steps reached")
+                                    logger.info(" Training terminated.")
+                                    train_iterator.close()
+                                return (
+                                    global_step,
+                                    tr_loss / global_step
+                                    if not self.args.evaluate_during_training
+                                    else training_progress_scores_main,
+                                )
+
+        return (
+            global_step,
+            tr_loss / global_step if not self.args.evaluate_during_training else training_progress_scores_main,
+        )
+
+
     def eval_model(
             self, eval_df, multi_label=False, output_dir=None, verbose=True, silent=False, wandb_log=True, **kwargs
     ):
@@ -886,6 +1716,7 @@ class MonoTransQuestModel:
 
         return result, model_outputs, wrong_preds
 
+    # HANNA: Achtung multi-label ist hardgecoded
     def evaluate(
             self, eval_df, output_dir, multi_label=False, prefix="", verbose=True, silent=False, wandb_log=True,
             **kwargs
@@ -895,10 +1726,13 @@ class MonoTransQuestModel:
 
         Utility function to be used by the eval_model() method. Not intended to be used directly.
         """
-
         model = self.model
         args = self.args
         eval_output_dir = output_dir
+
+        if "partial_input" in kwargs:
+            partial_input = kwargs.pop("partial_input")
+        else: partial_input = None
 
         results = {}
         if isinstance(eval_df, str) and self.args.lazy_loading:
@@ -994,6 +1828,7 @@ class MonoTransQuestModel:
 
                 if multi_label:
                     logits = logits.sigmoid()
+
                 if self.args.n_gpu > 1:
                     tmp_eval_loss = tmp_eval_loss.mean()
                 eval_loss += tmp_eval_loss.item()
@@ -1003,14 +1838,8 @@ class MonoTransQuestModel:
             start_index = self.args.eval_batch_size * i
             end_index = start_index + self.args.eval_batch_size if i != (n_batches - 1) else len(eval_dataset)
             preds[start_index:end_index] = logits.detach().cpu().numpy()
-            out_label_ids[start_index:end_index] = inputs["labels"].detach().cpu().numpy()
 
-            # if preds is None:
-            #     preds = logits.detach().cpu().numpy()
-            #     out_label_ids = inputs["labels"].detach().cpu().numpy()
-            # else:
-            #     preds = np.append(preds, logits.detach().cpu().numpy(), axis=0)
-            #     out_label_ids = np.append(out_label_ids, inputs["labels"].detach().cpu().numpy(), axis=0)
+            out_label_ids[start_index:end_index] = inputs["labels"].detach().cpu().numpy()
 
         eval_loss = eval_loss / nb_eval_steps
 
@@ -1055,10 +1884,45 @@ class MonoTransQuestModel:
             for key in sorted(result.keys()):
                 writer.write("{} = {}\n".format(key, str(result[key])))
 
+        if self.args.wandb_project and wandb_log and not multi_label and self.args.regression and partial_input is not None:
+            if not wandb.setup().settings.sweep_id:
+                logger.info(" Initializing WandB run for evaluation.")
+                wandb.init(project=args.wandb_project, config={**asdict(args)}, group=self.wandb_group, **args.wandb_kwargs)
+
+            if not self.args.sliding_window:
+                # MSE
+                wandb.log({"rmse_main_model_" +partial_input: result['rmse']})
+
+                # Pearson R
+                wandb.log({"corr_pearson_main_model_" +partial_input: result['pearson_corr']})
+
+                # Spearman Correlation
+                wandb.log({"corr_spearman_main_model_" +partial_input: result['spearman_corr']})
+
+                regression_eval_table = wandb.Table(columns=["Run","RMSE", "Pearson R", "Spearman"], data=[[wandb.run.name, result['rmse'], result['pearson_corr'], result['spearman_corr']]])
+                wandb.log({"Regression Evaluation Main Model on"+partial_input: regression_eval_table})
+
+                if partial_input == "both":
+                    plt.figure()
+
+                    plt.hist(eval_df["labels"], label="Mean Score Distribution", color=(1, 1, 1, 0), edgecolor="r")
+                    pearson_R = result['pearson_corr']
+                    plt.hist(preds, label="MultiTransQuest Predictions Distribution",
+                             color=(0, 0, 1, 0.5))
+                    plt.legend()
+                    # ADD CORRELATION TO TITLE
+                    plt.title("Score Distribution\nPearson R (real & predicted scores): " + str(pearson_R))
+                    plt.xlabel("Quality Score")
+
+                    plt.savefig("score_distribution.jpg")
+                    img = Image.open("score_distribution.jpg")
+                    wandb.log({"score_distribution": wandb.Image(img)})
+
+
         if self.args.wandb_project and wandb_log and not multi_label and not self.args.regression:
             if not wandb.setup().settings.sweep_id:
                 logger.info(" Initializing WandB run for evaluation.")
-                wandb.init(project=args.wandb_project, config={**asdict(args)}, **args.wandb_kwargs)
+                wandb.init(project=args.wandb_project, group=self.wandb_group, config={**asdict(args)}, **args.wandb_kwargs)
             if not args.labels_map:
                 self.args.labels_map = {i: i for i in range(self.num_labels)}
 
@@ -1147,7 +2011,7 @@ class MonoTransQuestModel:
                 sep_token=tokenizer.sep_token,
                 # RoBERTa uses an extra separator b/w pairs of sentences,
                 # cf. github.com/pytorch/fairseq/commit/1684e166e3da03f5b600dbb7855cb98ddfcd0805
-                sep_token_extra=bool(args.model_type in ["roberta", "camembert", "xlmroberta", "longformer"]),
+                sep_token_extra=bool(args.model_type in ["roberta", "camembert", "xlmroberta", "longformer", "rembert"]),
                 # PAD on the left for XLNet
                 pad_on_left=bool(args.model_type in ["xlnet"]),
                 pad_token=tokenizer.convert_tokens_to_ids([tokenizer.pad_token])[0],
@@ -1159,7 +2023,7 @@ class MonoTransQuestModel:
                 sliding_window=args.sliding_window,
                 flatten=not evaluate,
                 stride=args.stride,
-                add_prefix_space=bool(args.model_type in ["roberta", "camembert", "xlmroberta", "longformer"]),
+                add_prefix_space=bool(args.model_type in ["roberta", "camembert", "xlmroberta", "longformer", "rembert"]),
                 # avoid padding in case of single example/online inferencing to decrease execution time
                 pad_to_max_length=bool(len(examples) > 1),
                 args=args,
@@ -1350,7 +2214,9 @@ class MonoTransQuestModel:
                 model.eval()
                 preds = None
                 out_label_ids = None
-                for i, batch in enumerate(tqdm(eval_dataloader, disable=args.silent, desc="Running Prediction")):
+                # HANNA CHANGE
+                #for i, batch in enumerate(tqdm(eval_dataloader, disable=args.silent, desc="Running Prediction")):
+                for i, batch in enumerate(eval_dataloader):
                     # batch = tuple(t.to(device) for t in batch)
                     with torch.no_grad():
                         inputs = self._get_inputs_dict(batch)
@@ -1393,7 +2259,10 @@ class MonoTransQuestModel:
                         )
             else:
                 n_batches = len(eval_dataloader)
-                for i, batch in enumerate(tqdm(eval_dataloader, disable=args.silent)):
+                # HANNA Edit
+                #for i, batch in enumerate(tqdm(eval_dataloader, disable=args.silent)):
+                for i, batch in enumerate(eval_dataloader):
+
                     model.eval()
                     # batch = tuple(t.to(device) for t in batch)
 
@@ -1564,6 +2433,7 @@ class MonoTransQuestModel:
                     "eval_loss": [],
                     **extra_metrics,
                 }
+
             else:
                 training_progress_scores = {
                     "global_step": [],

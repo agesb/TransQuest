@@ -75,7 +75,7 @@ class TransQuestArgs:
     save_best_model: bool = True
     save_eval_checkpoints: bool = True
     save_model_every_epoch: bool = True
-    save_optimizer_and_scheduler: bool = True
+    save_optimizer_and_scheduler: bool = False
     save_recent_only: bool = True
     save_steps: int = 2000
     scheduler: str = "linear_schedule_with_warmup"
@@ -121,12 +121,18 @@ class TransQuestArgs:
 
 
 @dataclass
-class MonoTransQuestArgs(TransQuestArgs):
+class MultiTransQuestArgs(TransQuestArgs):
     """
     Model args for a ClassificationModel
     """
 
-    model_class: str = "MonoTransQuestModel"
+    num_tasks: int = 2
+    regression: list = field(default_factory=list)
+    num_labels : list = field(default_factory=list)
+    grad_weights : list = field(default_factory=list)
+    task_weights: list = field(default_factory=list)
+    num_shared_decoder_layers: int = 1
+    model_class: str = "MultiTransQuestModel"
     labels_list: list = field(default_factory=list)
     labels_map: dict = field(default_factory=dict)
     lazy_delimiter: str = "\t"
@@ -137,7 +143,6 @@ class MonoTransQuestArgs(TransQuestArgs):
     lazy_text_b_column: bool = None
     lazy_text_column: int = 0
     onnx: bool = False
-    regression: bool = True
     sliding_window: bool = False
     special_tokens_list: list = field(default_factory=list)
     stride: float = 0.8

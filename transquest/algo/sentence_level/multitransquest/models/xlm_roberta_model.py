@@ -1,0 +1,9 @@
+
+from transformers.models.xlm_roberta.configuration_xlm_roberta import XLMRobertaConfig
+from transformers.models.xlm_roberta.modeling_xlm_roberta import XLM_ROBERTA_PRETRAINED_MODEL_ARCHIVE_LIST
+
+from CODE.transquest.algo.sentence_level.multitransquest.models.roberta_model import RobertaForMultitaskSequenceClassification
+
+class XLMRobertaForMultitaskSequenceClassification(RobertaForMultitaskSequenceClassification):
+    config_class = XLMRobertaConfig
+    pretrained_model_archive_map = XLM_ROBERTA_PRETRAINED_MODEL_ARCHIVE_LIST

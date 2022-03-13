@@ -1,18 +1,12 @@
 from torch.nn import CrossEntropyLoss, MSELoss
-from transformers import BertPreTrainedModel
-from transformers.models.roberta.modeling_roberta import (
-    ROBERTA_PRETRAINED_MODEL_ARCHIVE_LIST,
-    RobertaClassificationHead,
-    RobertaConfig,
-    RobertaModel,
-)
+from transformers.models.xlm.modeling_xlm import SequenceSummary, XLMModel, XLMPreTrainedModel
 
 
-class RobertaForSequenceClassification(BertPreTrainedModel):
+class XLMForSequenceClassification(XLMPreTrainedModel):
     r"""
         **labels**: (`optional`) ``torch.LongTensor`` of shape ``(batch_size,)``:
             Labels for computing the sequence classification/regression loss.
-            Indices should be in ``[0, ..., config.num_labels]``.
+            Indices should be in ``[0, ..., config.num_labels - 1]``.
             If ``config.num_labels == 1`` a regression loss is computed (Mean-Square loss),
             If ``config.num_labels > 1`` a classification loss is computed (Cross-Entropy).
     Outputs: `Tuple` comprising various elements depending on the configuration (config) and inputs:
@@ -28,61 +22,65 @@ class RobertaForSequenceClassification(BertPreTrainedModel):
             list of ``torch.FloatTensor`` (one for each layer) of shape ``(batch_size, num_heads, sequence_length, sequence_length)``:
             Attentions weights after the attention softmax, used to compute the weighted average in the self-attention heads.
     Examples::
-        tokenizer = RobertaTokenizer.from_pretrained('roberta-base')
-        model = RobertaForSequenceClassification.from_pretrained('roberta-base')
+        tokenizer = XLMTokenizer.from_pretrained('xlm-mlm-en-2048')
+        model = XLMForSequenceClassification.from_pretrained('xlm-mlm-en-2048')
         input_ids = torch.tensor(tokenizer.encode("Hello, my dog is cute")).unsqueeze(0)  # Batch size 1
         labels = torch.tensor([1]).unsqueeze(0)  # Batch size 1
         outputs = model(input_ids, labels=labels)
         loss, logits = outputs[:2]
     """  # noqa: ignore flake8"
-    config_class = RobertaConfig
-    pretrained_model_archive_map = ROBERTA_PRETRAINED_MODEL_ARCHIVE_LIST
-    base_model_prefix = "roberta"
 
     def __init__(self, config, weight=None):
-        super(RobertaForSequenceClassification, self).__init__(config)
+        super(XLMForSequenceClassification, self).__init__(config)
         self.num_labels = config.num_labels
-
-        self.roberta = RobertaModel(config)
-        self.classifier = RobertaClassificationHead(config)
         self.weight = weight
+
+        self.transformer = XLMModel(config)
+        self.sequence_summary = SequenceSummary(config)
+
+        self.init_weights()
 
     def forward(
             self,
             input_ids=None,
             attention_mask=None,
+            langs=None,
             token_type_ids=None,
             position_ids=None,
+            lengths=None,
+            cache=None,
             head_mask=None,
             inputs_embeds=None,
             labels=None,
     ):
-        outputs = self.roberta(
+        transformer_outputs = self.transformer(
             input_ids,
             attention_mask=attention_mask,
+            langs=langs,
             token_type_ids=token_type_ids,
             position_ids=position_ids,
+            lengths=lengths,
+            cache=cache,
             head_mask=head_mask,
         )
-        sequence_output = outputs[0]
-        logits = self.classifier(sequence_output)
 
-        outputs = (logits,) + outputs[2:]
+        output = transformer_outputs[0]
+        logits = self.sequence_summary(output)
+
+        outputs = (logits,) + transformer_outputs[1:]  # Keep new_mems and attention/hidden states if they are here
+
         if labels is not None:
             if self.num_labels == 1:
                 #  We are doing regression
-                loss_fct = MSELoss(reduction='none')
-                loss_per_sample = loss_fct(logits.view(-1), labels.view(-1))
-                loss = loss_per_sample.mean()
+                loss_fct = MSELoss()
+                loss = loss_fct(logits.view(-1), labels.view(-1))
             else:
                 if self.weight is not None:
                     weight = self.weight.to(labels.device)
                 else:
                     weight = None
-                loss_fct = CrossEntropyLoss(weight=weight, reduction='none')
-                loss_per_sample = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
-                loss = loss_per_sample.mean()
+                loss_fct = CrossEntropyLoss(weight=weight)
+                loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+            outputs = (loss,) + outputs
 
-            outputs = (loss,) + outputs + (loss_per_sample,)
-
-        return outputs  # (loss), logits, (hidden_states), (attentions)
+        return outputs
